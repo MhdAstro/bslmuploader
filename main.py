@@ -1,3 +1,5 @@
+# main.py
+
 import asyncio
 import httpx
 import base64
@@ -43,7 +45,7 @@ class ImageProcessResponse(BaseModel):
 app = FastAPI(
     title="Basalam Image Processing Service",
     description="سرویسی برای بررسی، سانسور و آپلود تصاویر در باسلام.",
-    version="3.2.0" # Version with configurable parameters
+    version="3.3.0" # Version with resilient censorship
 )
 
 # --- 4. توابع کمکی برای ارتباط با سرویس‌های دیگر ---
@@ -134,26 +136,45 @@ async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes)
     except (httpx.RequestError, KeyError, IndexError) as e:
         raise HTTPException(status_code=503, detail=f"Could not connect to or parse response from Basalam upload service: '{e}'")
 
+# ✨ --- تابع اصلاح شده --- ✨
 async def process_single_image(session: httpx.AsyncClient, image_url: str, is_forbidden: bool) -> Dict[str, str]:
-    """A complete processing cycle for a single image: download, censor (if needed), and upload."""
+    """
+    A complete processing cycle for a single image.
+    If censorship fails, it logs the error and uploads the original image.
+    """
     try:
+        # 1. Download the original image
         download_response = await session.get(image_url, timeout=30.0)
         download_response.raise_for_status()
         image_data = download_response.content
         content_type = download_response.headers.get('content-type', 'image/jpeg')
 
+        # 2. Assume the final image is the original one
         final_image_data = image_data
-        if is_forbidden:
-            final_image_data = await censor_image(session, image_data, content_type)
 
+        # 3. If forbidden, try to censor it
+        if is_forbidden:
+            try:
+                # This is the call that might fail
+                censored_data = await censor_image(session, image_data, content_type)
+                final_image_data = censored_data # If successful, update the final data
+                print(f"INFO: Successfully censored image: {image_url}")
+            except HTTPException as e:
+                # 4. If censorship fails, log it and proceed with the original image
+                print(f"WARNING: Censorship failed for {image_url}. Uploading original. Reason: {e.detail}")
+
+        # 5. Upload the final image (either original or censored)
         upload_result = await upload_image_to_basalam(session, final_image_data)
         return upload_result
 
     except httpx.RequestError as e:
+        # This error is for download failure, which is critical
         return {"error": f"FAILED_DOWNLOAD:{image_url}", "details": str(e)}
     except HTTPException as e:
+        # This will now mostly catch errors from upload_image_to_basalam
         return {"error": f"PROCESSING_FAILED:{image_url}", "details": e.detail}
     except Exception as e:
+        # Catch any other unexpected errors
         return {"error": f"UNEXPECTED_ERROR:{image_url}", "details": str(e)}
 
 # --- 5. تعریف Endpoint اصلی API ---
