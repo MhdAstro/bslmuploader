@@ -13,6 +13,10 @@ from typing import List, Dict, Optional, Any, Callable, Coroutine
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
 
+# Censorship retry settings (less retries since it's slow)
+CENSOR_MAX_RETRIES = 1  # Only try once since SafeImage is slow
+CENSOR_TIMEOUT = 90  # 90 second timeout for censorship
+
 # ✨ --- دکوریتور جدید برای تلاش مجدد --- ✨
 def async_retry(max_retries: int = MAX_RETRIES, delay: int = RETRY_DELAY_SECONDS):
     """
@@ -41,15 +45,15 @@ class Settings(BaseSettings):
     basalam_upload_token: str
     revision_api_token: str
 
-    # SafeImage censorship parameters
+    # SafeImage censorship parameters (optimized for speed)
     safeimage_sigma_blur: str = "25"
     safeimage_feather: str = "5"
-    safeimage_show_mask: str = "true"
+    safeimage_show_mask: str = "false"  # Disabled to reduce response size
     safeimage_only_clothes: str = "false"
     safeimage_blur_face: str = "true"
     safeimage_blur_hair: str = "true"
-    safeimage_blur_arms: str = "true"
-    safeimage_blur_legs: str = "true"
+    safeimage_blur_arms: str = "false"  # Disabled for faster processing
+    safeimage_blur_legs: str = "false"  # Disabled for faster processing
     safeimage_blur_torso: str = "false"
 
 settings = Settings()
@@ -90,7 +94,7 @@ async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str
     response.raise_for_status()
     return response.json()
 
-@async_retry()
+@async_retry(max_retries=CENSOR_MAX_RETRIES, delay=2)
 async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> bytes:
     """Sends an image to the censorship service with all required parameters."""
     url = "https://safeimage.adminai.ir/process"
@@ -120,8 +124,10 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
 
-    # Send request to SafeImage service
-    response = await session.post(url, data=form_data, files=files, headers=headers, timeout=60.0)
+    # Send request to SafeImage service with extended timeout
+    print(f"DEBUG: Sending image to SafeImage (size: {len(image_data)} bytes)...")
+    response = await session.post(url, data=form_data, files=files, headers=headers, timeout=CENSOR_TIMEOUT)
+    print(f"DEBUG: SafeImage responded with status {response.status_code}")
     response.raise_for_status()
 
     # Parse response according to the actual structure
