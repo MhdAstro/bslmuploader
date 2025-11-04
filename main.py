@@ -40,8 +40,18 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8')
     basalam_upload_token: str
     revision_api_token: str
-    # ... سایر تنظیمات
-    
+
+    # SafeImage censorship parameters
+    safeimage_sigma_blur: str = "25"
+    safeimage_feather: str = "5"
+    safeimage_show_mask: str = "true"
+    safeimage_only_clothes: str = "false"
+    safeimage_blur_face: str = "true"
+    safeimage_blur_hair: str = "true"
+    safeimage_blur_arms: str = "true"
+    safeimage_blur_legs: str = "true"
+    safeimage_blur_torso: str = "false"
+
 settings = Settings()
 
 # --- 2. مدل‌های داده (Pydantic) ---
@@ -82,18 +92,64 @@ async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str
 
 @async_retry()
 async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> bytes:
-    """Sends an image to the censorship service."""
-    # ... (کد داخلی این تابع بدون تغییر باقی می‌ماند)
+    """Sends an image to the censorship service with all required parameters."""
     url = "https://safeimage.adminai.ir/process"
-    form_data = { "sigma_blur": "25" } # Simplified for brevity
-    files = {"image": ("image.jpg", image_data, content_type)}
-    response = await session.post(url, data=form_data, files=files, timeout=45.0)
+
+    # Prepare form data with all SafeImage parameters matching the curl request
+    form_data = {
+        "sigma_blur": settings.safeimage_sigma_blur,
+        "feather": settings.safeimage_feather,
+        "show_mask": settings.safeimage_show_mask,
+        "only_clothes": settings.safeimage_only_clothes,
+        "blur_face": settings.safeimage_blur_face,
+        "blur_hair": settings.safeimage_blur_hair,
+        "blur_arms": settings.safeimage_blur_arms,
+        "blur_legs": settings.safeimage_blur_legs,
+        "blur_torso": settings.safeimage_blur_torso,
+    }
+
+    # Prepare image file with proper content type
+    files = {"image": ("image.jpg", image_data, content_type or "image/jpeg")}
+
+    # Add headers similar to the curl request
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9,fa;q=0.8",
+        "origin": "https://safeimage.adminai.ir",
+        "referer": "https://safeimage.adminai.ir/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    # Send request to SafeImage service
+    response = await session.post(url, data=form_data, files=files, headers=headers, timeout=60.0)
     response.raise_for_status()
+
+    # Parse response according to the actual structure
     result_data = response.json()
+
     if result_data.get("success") is True and "blurred_image" in result_data:
-        base64_image_str = result_data["blurred_image"].split(',')[-1]
-        return base64.b64decode(base64_image_str + '==')
-    raise HTTPException(status_code=500, detail="Censorship failed with valid response.")
+        blurred_image = result_data["blurred_image"]
+
+        # Handle base64 with or without data URI prefix
+        if blurred_image.startswith("data:"):
+            # Remove data URI prefix (e.g., "data:image/jpeg;base64,")
+            base64_image_str = blurred_image.split(',', 1)[1]
+        else:
+            base64_image_str = blurred_image
+
+        # Decode base64 to bytes (handle padding if needed)
+        try:
+            # Add padding if necessary
+            missing_padding = len(base64_image_str) % 4
+            if missing_padding:
+                base64_image_str += '=' * (4 - missing_padding)
+            return base64.b64decode(base64_image_str)
+        except Exception as e:
+            print(f"ERROR: Failed to decode base64 image from SafeImage. Error: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to decode censored image: {e}")
+
+    # If success is False or blurred_image is missing
+    raise HTTPException(status_code=500, detail=f"Censorship service returned unsuccessful response: {result_data}")
 
 
 @async_retry()
@@ -117,16 +173,17 @@ async def process_single_image(session: httpx.AsyncClient, image_url: str, is_fo
         image_data, content_type = await download_image(session, image_url)
         final_image_data = image_data
 
-        # TEMPORARILY DISABLED: Censorship service is not working
-        # TODO: Re-enable when SafeImage service is back online
-        # if is_forbidden:
-        #     try:
-        #         # تلاش مجدد برای سانسور توسط دکوریتور انجام می‌شود
-        #         final_image_data = await censor_image(session, image_data, content_type)
-        #     except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
-        #         # اگر سانسور بعد از همه تلاش‌ها شکست خورد، تصویر را نادیده بگیر
-        #         print(f"ERROR: Censorship ultimately failed for {image_url}. Skipping. Reason: {e}")
-        #         return None
+        # Apply censorship if image is marked as forbidden
+        if is_forbidden:
+            try:
+                print(f"INFO: Image {image_url} is forbidden. Applying censorship...")
+                # تلاش مجدد برای سانسور توسط دکوریتور انجام می‌شود
+                final_image_data = await censor_image(session, image_data, content_type)
+                print(f"SUCCESS: Censorship applied successfully for {image_url}")
+            except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
+                # اگر سانسور بعد از همه تلاش‌ها شکست خورد، تصویر را نادیده بگیر
+                print(f"ERROR: Censorship ultimately failed for {image_url}. Skipping this image. Reason: {e}")
+                return None
 
         # تلاش مجدد برای آپلود توسط دکوریتور انجام می‌شود
         return await upload_image_to_basalam(session, final_image_data)
