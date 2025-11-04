@@ -117,15 +117,17 @@ async def process_single_image(session: httpx.AsyncClient, image_url: str, is_fo
         image_data, content_type = await download_image(session, image_url)
         final_image_data = image_data
 
-        if is_forbidden:
-            try:
-                # تلاش مجدد برای سانسور توسط دکوریتور انجام می‌شود
-                final_image_data = await censor_image(session, image_data, content_type)
-            except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
-                # اگر سانسور بعد از همه تلاش‌ها شکست خورد، تصویر را نادیده بگیر
-                print(f"ERROR: Censorship ultimately failed for {image_url}. Skipping. Reason: {e}")
-                return None
-        
+        # TEMPORARILY DISABLED: Censorship service is not working
+        # TODO: Re-enable when SafeImage service is back online
+        # if is_forbidden:
+        #     try:
+        #         # تلاش مجدد برای سانسور توسط دکوریتور انجام می‌شود
+        #         final_image_data = await censor_image(session, image_data, content_type)
+        #     except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
+        #         # اگر سانسور بعد از همه تلاش‌ها شکست خورد، تصویر را نادیده بگیر
+        #         print(f"ERROR: Censorship ultimately failed for {image_url}. Skipping. Reason: {e}")
+        #         return None
+
         # تلاش مجدد برای آپلود توسط دکوریتور انجام می‌شود
         return await upload_image_to_basalam(session, final_image_data)
 
