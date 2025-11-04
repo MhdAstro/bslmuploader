@@ -181,9 +181,9 @@ async def process_single_image(session: httpx.AsyncClient, image_url: str, is_fo
                 final_image_data = await censor_image(session, image_data, content_type)
                 print(f"SUCCESS: Censorship applied successfully for {image_url}")
             except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
-                # اگر سانسور بعد از همه تلاش‌ها شکست خورد، تصویر را نادیده بگیر
-                print(f"ERROR: Censorship ultimately failed for {image_url}. Skipping this image. Reason: {e}")
-                return None
+                # اگر سانسور شکست خورد، تصویر اصلی را آپلود می‌کنیم (fallback behavior)
+                print(f"WARNING: Censorship failed for {image_url}. Uploading original uncensored image as fallback. Reason: {e}")
+                # final_image_data remains as the original image_data
 
         # تلاش مجدد برای آپلود توسط دکوریتور انجام می‌شود
         return await upload_image_to_basalam(session, final_image_data)
