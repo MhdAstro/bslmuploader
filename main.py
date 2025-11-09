@@ -96,20 +96,15 @@ async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str
     return response.json()
 
 @async_retry()
-async def check_single_image_revision(session: httpx.AsyncClient, image_data: bytes) -> bool:
+async def check_single_image_revision_by_url(session: httpx.AsyncClient, image_url: str) -> bool:
     """
-    Check a single image with revision service using base64 data.
+    Check a single image with revision service using URL.
     Returns True if forbidden, False if acceptable.
     """
     url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
     headers = {"api-token": settings.revision_api_token}
 
-    # Convert image to base64 data URI
-    import base64
-    base64_data = base64.b64encode(image_data).decode('utf-8')
-    data_uri = f"data:image/jpeg;base64,{base64_data}"
-
-    payload = {"images": [{"file_id": 0, "url": data_uri}]}
+    payload = {"images": [{"file_id": 0, "url": image_url}]}
 
     try:
         response = await session.post(url, headers=headers, json=payload, timeout=30.0)
@@ -117,10 +112,12 @@ async def check_single_image_revision(session: httpx.AsyncClient, image_data: by
         result = response.json()
 
         if result and len(result) > 0:
-            return result[0].get('is_forbidden', True)
+            is_forbidden = result[0].get('is_forbidden', True)
+            print(f"  → Revision check result: {'FORBIDDEN' if is_forbidden else 'ACCEPTABLE'}")
+            return is_forbidden
         return True  # Default to forbidden if unclear
     except Exception as e:
-        print(f"WARNING: Revision check failed, assuming forbidden: {e}")
+        print(f"  WARNING: Revision check failed, assuming forbidden: {e}")
         return True  # Assume forbidden if check fails
 
 @async_retry(max_retries=CENSOR_MAX_RETRIES, delay=2)
@@ -196,7 +193,7 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
     raise HTTPException(status_code=500, detail=f"Censorship service returned unsuccessful response: {result_data}")
 
 
-async def censor_with_verification(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Optional[bytes]:
+async def censor_with_verification(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Optional[Dict[str, str]]:
     """
     Progressive censorship with verification loop.
     Tries multiple censorship levels until the image is acceptable or max attempts reached.
@@ -206,7 +203,7 @@ async def censor_with_verification(session: httpx.AsyncClient, image_data: bytes
     - Level 2: Face + Hair + Arms + Legs (moderate)
     - Level 3: Face + Hair + Arms + Legs + Torso (strict, everything)
 
-    Returns censored image data if successful, None if all attempts failed.
+    Returns upload result dict {"id": ..., "url": ...} if successful, None if all attempts failed.
     """
 
     censorship_levels = [
@@ -227,17 +224,24 @@ async def censor_with_verification(session: httpx.AsyncClient, image_data: bytes
                 blur_torso=level['blur_torso']
             )
 
-            print(f"  ✓ Censorship applied successfully")
+            print(f"  ✓ Censorship applied successfully (size: {len(censored_data)} bytes)")
 
-            # Verify with revision service
-            print(f"  Checking censored image with revision service...")
-            is_forbidden = await check_single_image_revision(session, censored_data)
+            # Upload censored image to get URL for verification
+            print(f"  → Uploading censored image to get URL for verification...")
+            upload_result = await upload_image_to_basalam(session, censored_data)
+            censored_url = upload_result["url"]
+            print(f"  ✓ Uploaded to: {censored_url}")
+
+            # Verify with revision service using URL (avoids 413 error)
+            print(f"  → Checking censored image with revision service...")
+            is_forbidden = await check_single_image_revision_by_url(session, censored_url)
 
             if not is_forbidden:
-                print(f"  ✓ SUCCESS! Censored image is now acceptable")
-                return censored_data
+                print(f"  ✓ SUCCESS! Censored image is now acceptable!")
+                return upload_result  # Return the upload result
             else:
                 print(f"  ✗ Still forbidden after {level['name']}, trying stricter level...")
+                # Note: Previously uploaded image stays on server (acceptable trade-off)
 
         except Exception as e:
             print(f"  ✗ Censorship {level['name']} failed: {e}")
@@ -275,20 +279,21 @@ async def process_single_image(session: httpx.AsyncClient, image_url: str, is_fo
                 print(f"INFO: Image {image_url} is forbidden. Starting progressive censorship with verification...")
 
                 # Use progressive censorship with verification loop
-                censored_data = await censor_with_verification(session, image_data, content_type)
+                # Returns upload result dict if successful, None if all levels failed
+                upload_result = await censor_with_verification(session, image_data, content_type)
 
-                if censored_data:
-                    final_image_data = censored_data
-                    print(f"SUCCESS: Image successfully censored and verified for {image_url}")
+                if upload_result:
+                    print(f"SUCCESS: Image successfully censored, verified, and uploaded for {image_url}")
+                    return upload_result  # Already uploaded, return the result
                 else:
                     # All censorship attempts failed - upload original as fallback
                     print(f"WARNING: All censorship attempts failed for {image_url}. Uploading original uncensored image as fallback.")
-                    # final_image_data remains as the original image_data
+                    # Continue to upload original below
 
             except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
                 # اگر سانسور شکست خورد، تصویر اصلی را آپلود می‌کنیم (fallback behavior)
                 print(f"WARNING: Censorship failed for {image_url}. Uploading original uncensored image as fallback. Reason: {e}")
-                # final_image_data remains as the original image_data
+                # Continue to upload original below
 
         # تلاش مجدد برای آپلود توسط دکوریتور انجام می‌شود
         return await upload_image_to_basalam(session, final_image_data)
