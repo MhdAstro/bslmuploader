@@ -16,6 +16,7 @@ RETRY_DELAY_SECONDS = 1
 # Censorship retry settings (less retries since it's slow)
 CENSOR_MAX_RETRIES = 1  # Only try once since SafeImage is slow
 CENSOR_TIMEOUT = 90  # 90 second timeout for censorship
+MAX_CENSORSHIP_ATTEMPTS = 3  # Maximum attempts to censor and verify
 
 # ✨ --- دکوریتور جدید برای تلاش مجدد --- ✨
 def async_retry(max_retries: int = MAX_RETRIES, delay: int = RETRY_DELAY_SECONDS):
@@ -94,10 +95,47 @@ async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str
     response.raise_for_status()
     return response.json()
 
+@async_retry()
+async def check_single_image_revision(session: httpx.AsyncClient, image_data: bytes) -> bool:
+    """
+    Check a single image with revision service using base64 data.
+    Returns True if forbidden, False if acceptable.
+    """
+    url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
+    headers = {"api-token": settings.revision_api_token}
+
+    # Convert image to base64 data URI
+    import base64
+    base64_data = base64.b64encode(image_data).decode('utf-8')
+    data_uri = f"data:image/jpeg;base64,{base64_data}"
+
+    payload = {"images": [{"file_id": 0, "url": data_uri}]}
+
+    try:
+        response = await session.post(url, headers=headers, json=payload, timeout=30.0)
+        response.raise_for_status()
+        result = response.json()
+
+        if result and len(result) > 0:
+            return result[0].get('is_forbidden', True)
+        return True  # Default to forbidden if unclear
+    except Exception as e:
+        print(f"WARNING: Revision check failed, assuming forbidden: {e}")
+        return True  # Assume forbidden if check fails
+
 @async_retry(max_retries=CENSOR_MAX_RETRIES, delay=2)
-async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> bytes:
-    """Sends an image to the censorship service with all required parameters."""
+async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str],
+                      blur_arms: bool = None, blur_legs: bool = None, blur_torso: bool = None) -> bytes:
+    """
+    Sends an image to the censorship service with configurable blur parameters.
+    Allows overriding specific blur settings for progressive censorship.
+    """
     url = "https://safeimage.adminai.ir/process"
+
+    # Use provided parameters or fall back to settings
+    use_blur_arms = blur_arms if blur_arms is not None else settings.safeimage_blur_arms == "true"
+    use_blur_legs = blur_legs if blur_legs is not None else settings.safeimage_blur_legs == "true"
+    use_blur_torso = blur_torso if blur_torso is not None else settings.safeimage_blur_torso == "true"
 
     # Prepare form data with all SafeImage parameters matching the curl request
     form_data = {
@@ -107,9 +145,9 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
         "only_clothes": settings.safeimage_only_clothes,
         "blur_face": settings.safeimage_blur_face,
         "blur_hair": settings.safeimage_blur_hair,
-        "blur_arms": settings.safeimage_blur_arms,
-        "blur_legs": settings.safeimage_blur_legs,
-        "blur_torso": settings.safeimage_blur_torso,
+        "blur_arms": "true" if use_blur_arms else "false",
+        "blur_legs": "true" if use_blur_legs else "false",
+        "blur_torso": "true" if use_blur_torso else "false",
     }
 
     # Prepare image file with proper content type
@@ -158,6 +196,58 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
     raise HTTPException(status_code=500, detail=f"Censorship service returned unsuccessful response: {result_data}")
 
 
+async def censor_with_verification(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Optional[bytes]:
+    """
+    Progressive censorship with verification loop.
+    Tries multiple censorship levels until the image is acceptable or max attempts reached.
+
+    Censorship Levels:
+    - Level 1: Face + Hair only (fast)
+    - Level 2: Face + Hair + Arms + Legs (moderate)
+    - Level 3: Face + Hair + Arms + Legs + Torso (strict, everything)
+
+    Returns censored image data if successful, None if all attempts failed.
+    """
+
+    censorship_levels = [
+        {"name": "Level 1 (Face + Hair)", "blur_arms": False, "blur_legs": False, "blur_torso": False},
+        {"name": "Level 2 (+ Arms + Legs)", "blur_arms": True, "blur_legs": True, "blur_torso": False},
+        {"name": "Level 3 (+ Torso - Everything)", "blur_arms": True, "blur_legs": True, "blur_torso": True},
+    ]
+
+    for attempt, level in enumerate(censorship_levels, 1):
+        try:
+            print(f"  Attempt {attempt}/{len(censorship_levels)}: Applying {level['name']}...")
+
+            # Apply censorship with current level
+            censored_data = await censor_image(
+                session, image_data, content_type,
+                blur_arms=level['blur_arms'],
+                blur_legs=level['blur_legs'],
+                blur_torso=level['blur_torso']
+            )
+
+            print(f"  ✓ Censorship applied successfully")
+
+            # Verify with revision service
+            print(f"  Checking censored image with revision service...")
+            is_forbidden = await check_single_image_revision(session, censored_data)
+
+            if not is_forbidden:
+                print(f"  ✓ SUCCESS! Censored image is now acceptable")
+                return censored_data
+            else:
+                print(f"  ✗ Still forbidden after {level['name']}, trying stricter level...")
+
+        except Exception as e:
+            print(f"  ✗ Censorship {level['name']} failed: {e}")
+            if attempt == len(censorship_levels):
+                print(f"  All censorship attempts exhausted")
+                return None
+
+    print(f"  WARNING: All censorship levels tried, image still forbidden")
+    return None
+
 @async_retry()
 async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes) -> Dict[str, str]:
     """تصویر نهایی را آپلود می‌کند."""
@@ -179,13 +269,22 @@ async def process_single_image(session: httpx.AsyncClient, image_url: str, is_fo
         image_data, content_type = await download_image(session, image_url)
         final_image_data = image_data
 
-        # Apply censorship if image is marked as forbidden
+        # Apply progressive censorship if image is marked as forbidden
         if is_forbidden:
             try:
-                print(f"INFO: Image {image_url} is forbidden. Applying censorship...")
-                # تلاش مجدد برای سانسور توسط دکوریتور انجام می‌شود
-                final_image_data = await censor_image(session, image_data, content_type)
-                print(f"SUCCESS: Censorship applied successfully for {image_url}")
+                print(f"INFO: Image {image_url} is forbidden. Starting progressive censorship with verification...")
+
+                # Use progressive censorship with verification loop
+                censored_data = await censor_with_verification(session, image_data, content_type)
+
+                if censored_data:
+                    final_image_data = censored_data
+                    print(f"SUCCESS: Image successfully censored and verified for {image_url}")
+                else:
+                    # All censorship attempts failed - upload original as fallback
+                    print(f"WARNING: All censorship attempts failed for {image_url}. Uploading original uncensored image as fallback.")
+                    # final_image_data remains as the original image_data
+
             except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
                 # اگر سانسور شکست خورد، تصویر اصلی را آپلود می‌کنیم (fallback behavior)
                 print(f"WARNING: Censorship failed for {image_url}. Uploading original uncensored image as fallback. Reason: {e}")
