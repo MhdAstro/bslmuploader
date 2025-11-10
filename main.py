@@ -85,39 +85,104 @@ async def download_image(session: httpx.AsyncClient, image_url: str) -> tuple[by
     content_type = response.headers.get('content-type', 'image/jpeg')
     return image_data, content_type
 
-@async_retry()
 async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str]) -> List[Dict]:
-    """لیستی از تصاویر را برای بررسی به سرویس باسلام ارسال می‌کند."""
-    url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
+    """
+    Check multiple images with revision service.
+    Uses bulk API first, falls back to single API calls if bulk fails (504 timeout).
+    """
+    bulk_url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
     headers = {"api-token": settings.revision_api_token}
     payload = {"images": [{"file_id": index, "url": img_url} for index, img_url in enumerate(image_urls)]}
-    response = await session.post(url, headers=headers, json=payload, timeout=30.0)
-    response.raise_for_status()
-    return response.json()
 
-@async_retry()
+    try:
+        print(f"Checking {len(image_urls)} images with bulk revision API...")
+        response = await session.post(bulk_url, headers=headers, json=payload, timeout=30.0)
+        response.raise_for_status()
+        result = response.json()
+        print(f"✓ Bulk API check successful")
+        return result
+
+    except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+        # Bulk API failed - fall back to individual single API calls
+        print(f"⚠ Bulk API failed ({type(e).__name__}), falling back to single API calls...")
+
+        results = []
+        single_url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector"
+
+        for index, img_url in enumerate(image_urls):
+            try:
+                params = {"image_url": img_url}
+                response = await session.get(single_url, headers=headers, params=params, timeout=30.0)
+                response.raise_for_status()
+                result = response.json()
+
+                # Convert single API response to bulk API format
+                results.append({
+                    "file_id": index,
+                    "url": img_url,
+                    "is_forbidden": result.get('is_forbidden', True)
+                })
+
+            except Exception as single_error:
+                print(f"✗ Single API failed for image {index}: {single_error}")
+                # Assume forbidden if check fails
+                results.append({
+                    "file_id": index,
+                    "url": img_url,
+                    "is_forbidden": True
+                })
+
+        print(f"✓ Completed {len(results)} single API checks")
+        return results
+
 async def check_single_image_revision_by_url(session: httpx.AsyncClient, image_url: str) -> bool:
     """
     Check a single image with revision service using URL.
+    Uses bulk API first, falls back to single API if bulk fails (504 timeout).
     Returns True if forbidden, False if acceptable.
     """
-    url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
+    # Try bulk API first
+    bulk_url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
     headers = {"api-token": settings.revision_api_token}
-
     payload = {"images": [{"file_id": 0, "url": image_url}]}
 
     try:
-        response = await session.post(url, headers=headers, json=payload, timeout=30.0)
+        print(f"  → Trying bulk revision API...")
+        response = await session.post(bulk_url, headers=headers, json=payload, timeout=30.0)
         response.raise_for_status()
         result = response.json()
 
         if result and len(result) > 0:
             is_forbidden = result[0].get('is_forbidden', True)
-            print(f"  → Revision check result: {'FORBIDDEN' if is_forbidden else 'ACCEPTABLE'}")
+            print(f"  → Bulk API result: {'FORBIDDEN' if is_forbidden else 'ACCEPTABLE'}")
             return is_forbidden
         return True  # Default to forbidden if unclear
+
+    except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+        # Bulk API failed (504 timeout or other HTTP error) - fall back to single API
+        print(f"  ⚠ Bulk API failed ({type(e).__name__}), trying single API fallback...")
+
+        try:
+            # Use single image API as fallback
+            single_url = f"https://revision.basalam.com/api_v1.0/validation/image/hijab-detector"
+            params = {"image_url": image_url}
+
+            response = await session.get(single_url, headers=headers, params=params, timeout=30.0)
+            response.raise_for_status()
+            result = response.json()
+
+            # Single API response format: {"is_forbidden": bool, "evaluation_result": {...}}
+            is_forbidden = result.get('is_forbidden', True)
+            print(f"  ✓ Single API result: {'FORBIDDEN' if is_forbidden else 'ACCEPTABLE'}")
+            return is_forbidden
+
+        except Exception as fallback_error:
+            print(f"  ✗ Single API also failed: {fallback_error}")
+            print(f"  → Assuming FORBIDDEN as safe default")
+            return True  # Assume forbidden if both APIs fail
+
     except Exception as e:
-        print(f"  WARNING: Revision check failed, assuming forbidden: {e}")
+        print(f"  WARNING: Unexpected error in revision check: {e}")
         return True  # Assume forbidden if check fails
 
 @async_retry(max_retries=CENSOR_MAX_RETRIES, delay=2)
