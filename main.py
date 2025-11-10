@@ -332,11 +332,34 @@ async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes)
 
 
 # ✨ --- تابع اصلی پردازش (ساده‌تر شده) --- ✨
-async def process_single_image(session: httpx.AsyncClient, image_url: str, is_forbidden: bool) -> Optional[Dict[str, str]]:
+async def process_single_image(session: httpx.AsyncClient, image_url: str, is_forbidden: bool, initial_check_failed: bool = False) -> Optional[Dict[str, str]]:
     """Processes one image using resilient, retrying helper functions."""
     try:
         image_data, content_type = await download_image(session, image_url)
         final_image_data = image_data
+
+        # If initial check failed (temporary URLs), verify the original first
+        if initial_check_failed:
+            print(f"INFO: Initial check failed for {image_url}, uploading to verify...")
+            try:
+                # Upload original to get permanent URL
+                original_upload = await upload_image_to_basalam(session, image_data)
+                original_url = original_upload["url"]
+                print(f"  ✓ Uploaded original, checking with revision: {original_url}")
+
+                # Check if original is actually forbidden
+                is_actually_forbidden = await check_single_image_revision_by_url(session, original_url)
+
+                if not is_actually_forbidden:
+                    print(f"  ✓ Original image is ACCEPTABLE! No censorship needed.")
+                    return original_upload
+                else:
+                    print(f"  → Original is FORBIDDEN, will apply censorship...")
+                    # Continue to censorship below
+                    is_forbidden = True
+            except Exception as e:
+                print(f"  ⚠ Could not verify original, will apply censorship: {e}")
+                is_forbidden = True
 
         # Apply progressive censorship if image is marked as forbidden
         if is_forbidden:
@@ -377,20 +400,30 @@ async def process_images_endpoint(request: ImageProcessRequest):
         return {"processed_images": []}
 
     async with httpx.AsyncClient() as session:
+        # Try to check images with revision service
+        # If URLs are temporary/inaccessible, this will fail and we'll assume all are forbidden
+        initial_check_failed = False
         try:
-            # تلاش مجدد برای این تابع هم اعمال می‌شود
+            print(f"Initial revision check for {len(request.photo_links)} images...")
             revision_results = await check_images_revision(session, request.photo_links)
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Revision service is down. Cannot proceed. Error: {e}")
 
-        id_to_url_map = {index: url for index, url in enumerate(request.photo_links)}
-        url_to_forbidden_status = {
-            id_to_url_map.get(item.get('file_id')): item.get('is_forbidden', True)
-            for item in revision_results if item.get('file_id') in id_to_url_map
-        }
-        
+            id_to_url_map = {index: url for index, url in enumerate(request.photo_links)}
+            url_to_forbidden_status = {
+                id_to_url_map.get(item.get('file_id')): item.get('is_forbidden', True)
+                for item in revision_results if item.get('file_id') in id_to_url_map
+            }
+            print(f"✓ Initial revision check completed")
+
+        except Exception as e:
+            # Initial revision check failed (likely temporary URLs not accessible)
+            # Assume all images are forbidden - progressive censorship will verify properly
+            print(f"⚠ Initial revision check failed: {e}")
+            print(f"→ Assuming all images forbidden - will verify after censorship")
+            url_to_forbidden_status = {url: True for url in request.photo_links}
+            initial_check_failed = True
+
         tasks = [
-            process_single_image(session, url, url_to_forbidden_status.get(url, True))
+            process_single_image(session, url, url_to_forbidden_status.get(url, True), initial_check_failed)
             for url in request.photo_links
         ]
         
