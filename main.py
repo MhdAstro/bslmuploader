@@ -332,102 +332,130 @@ async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes)
 
 
 # ✨ --- تابع اصلی پردازش (ساده‌تر شده) --- ✨
-async def process_single_image(session: httpx.AsyncClient, image_url: str, is_forbidden: bool, initial_check_failed: bool = False) -> Optional[Dict[str, str]]:
-    """Processes one image using resilient, retrying helper functions."""
+async def download_and_upload_original(session: httpx.AsyncClient, image_url: str, index: int) -> Optional[Dict]:
+    """Downloads image and uploads original to Basalam to get permanent URL."""
     try:
+        print(f"[{index}] Downloading and uploading: {image_url}")
         image_data, content_type = await download_image(session, image_url)
-        final_image_data = image_data
+        upload_result = await upload_image_to_basalam(session, image_data)
 
-        # If initial check failed (temporary URLs), verify the original first
-        if initial_check_failed:
-            print(f"INFO: Initial check failed for {image_url}, uploading to verify...")
-            try:
-                # Upload original to get permanent URL
-                original_upload = await upload_image_to_basalam(session, image_data)
-                original_url = original_upload["url"]
-                print(f"  ✓ Uploaded original, checking with revision: {original_url}")
+        print(f"[{index}] ✓ Uploaded: {upload_result['url']}")
+        return {
+            "index": index,
+            "original_temp_url": image_url,
+            "uploaded_url": upload_result["url"],
+            "upload_result": upload_result,
+            "image_data": image_data,
+            "content_type": content_type
+        }
+    except Exception as e:
+        print(f"[{index}] ✗ Failed to download/upload: {e}")
+        return None
 
-                # Check if original is actually forbidden
-                is_actually_forbidden = await check_single_image_revision_by_url(session, original_url)
 
-                if not is_actually_forbidden:
-                    print(f"  ✓ Original image is ACCEPTABLE! No censorship needed.")
-                    return original_upload
-                else:
-                    print(f"  → Original is FORBIDDEN, will apply censorship...")
-                    # Continue to censorship below
-                    is_forbidden = True
-            except Exception as e:
-                print(f"  ⚠ Could not verify original, will apply censorship: {e}")
-                is_forbidden = True
+async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: Dict, is_forbidden: bool) -> Dict[str, str]:
+    """Apply progressive censorship if image is forbidden."""
+    index = image_info["index"]
 
-        # Apply progressive censorship if image is marked as forbidden
-        if is_forbidden:
-            try:
-                print(f"INFO: Image {image_url} is forbidden. Starting progressive censorship with verification...")
+    if not is_forbidden:
+        print(f"[{index}] ✓ Image is ACCEPTABLE, no censorship needed")
+        return image_info["upload_result"]
 
-                # Use progressive censorship with verification loop
-                # Returns upload result dict if successful, None if all levels failed
-                upload_result = await censor_with_verification(session, image_data, content_type)
+    print(f"[{index}] → Image is FORBIDDEN, applying progressive censorship...")
 
-                if upload_result:
-                    print(f"SUCCESS: Image successfully censored, verified, and uploaded for {image_url}")
-                    return upload_result  # Already uploaded, return the result
-                else:
-                    # All censorship attempts failed - upload original as fallback
-                    print(f"WARNING: All censorship attempts failed for {image_url}. Uploading original uncensored image as fallback.")
-                    # Continue to upload original below
+    try:
+        # Use progressive censorship with verification loop
+        upload_result = await censor_with_verification(
+            session,
+            image_info["image_data"],
+            image_info["content_type"]
+        )
 
-            except (httpx.RequestError, httpx.HTTPStatusError, HTTPException) as e:
-                # اگر سانسور شکست خورد، تصویر اصلی را آپلود می‌کنیم (fallback behavior)
-                print(f"WARNING: Censorship failed for {image_url}. Uploading original uncensored image as fallback. Reason: {e}")
-                # Continue to upload original below
-
-        # تلاش مجدد برای آپلود توسط دکوریتور انجام می‌شود
-        return await upload_image_to_basalam(session, final_image_data)
+        if upload_result:
+            print(f"[{index}] ✓ SUCCESS! Censored and verified")
+            return upload_result
+        else:
+            print(f"[{index}] ⚠ All censorship attempts failed, returning original")
+            return image_info["upload_result"]
 
     except Exception as e:
-        # این خطاها اکنون فقط برای شکست‌های نهایی (پس از همه تلاش‌ها) رخ می‌دهند
-        print(f"ERROR: A final error occurred for {image_url}. Skipping. Reason: {e}")
-        return {"error": f"PROCESSING_FAILED:{image_url}", "details": str(e)}
+        print(f"[{index}] ⚠ Censorship error: {e}, returning original")
+        return image_info["upload_result"]
 
 
 # --- 5. تعریف Endpoint اصلی API (بدون تغییر) ---
 @app.post("/process-images", response_model=ImageProcessResponse)
 async def process_images_endpoint(request: ImageProcessRequest):
-    # ... (کد داخلی این تابع بدون تغییر باقی می‌ماند)
+    """
+    New clean flow:
+    1. Upload all original images first → get permanent URLs
+    2. Check all permanent URLs with revision service
+    3. For forbidden images: apply progressive censorship
+    4. Return all final results
+    """
     if not request.photo_links:
         return {"processed_images": []}
 
     async with httpx.AsyncClient() as session:
-        # Try to check images with revision service
-        # If URLs are temporary/inaccessible, this will fail and we'll assume all are forbidden
-        initial_check_failed = False
-        try:
-            print(f"Initial revision check for {len(request.photo_links)} images...")
-            revision_results = await check_images_revision(session, request.photo_links)
+        print(f"\n{'='*60}")
+        print(f"STEP 1: Uploading {len(request.photo_links)} original images...")
+        print(f"{'='*60}")
 
-            id_to_url_map = {index: url for index, url in enumerate(request.photo_links)}
-            url_to_forbidden_status = {
-                id_to_url_map.get(item.get('file_id')): item.get('is_forbidden', True)
-                for item in revision_results if item.get('file_id') in id_to_url_map
-            }
-            print(f"✓ Initial revision check completed")
+        # Step 1: Upload all original images to get permanent URLs
+        upload_tasks = [
+            download_and_upload_original(session, url, index)
+            for index, url in enumerate(request.photo_links)
+        ]
+        uploaded_images = await asyncio.gather(*upload_tasks)
+        uploaded_images = [img for img in uploaded_images if img is not None]
+
+        if not uploaded_images:
+            print("✗ No images were successfully uploaded")
+            return {"processed_images": []}
+
+        print(f"✓ Successfully uploaded {len(uploaded_images)} images")
+
+        print(f"\n{'='*60}")
+        print(f"STEP 2: Checking uploaded images with revision service...")
+        print(f"{'='*60}")
+
+        # Step 2: Check all uploaded permanent URLs with revision service
+        uploaded_urls = [img["uploaded_url"] for img in uploaded_images]
+        try:
+            revision_results = await check_images_revision(session, uploaded_urls)
+
+            # Map results to uploaded images
+            url_to_forbidden = {}
+            for result in revision_results:
+                file_id = result.get('file_id')
+                if file_id is not None and file_id < len(uploaded_images):
+                    url = uploaded_images[file_id]["uploaded_url"]
+                    url_to_forbidden[url] = result.get('is_forbidden', True)
+
+            print(f"✓ Revision check completed")
 
         except Exception as e:
-            # Initial revision check failed (likely temporary URLs not accessible)
-            # Assume all images are forbidden - progressive censorship will verify properly
-            print(f"⚠ Initial revision check failed: {e}")
-            print(f"→ Assuming all images forbidden - will verify after censorship")
-            url_to_forbidden_status = {url: True for url in request.photo_links}
-            initial_check_failed = True
+            print(f"⚠ Revision check failed: {e}")
+            print(f"→ Assuming all images forbidden for safety")
+            url_to_forbidden = {img["uploaded_url"]: True for img in uploaded_images}
 
-        tasks = [
-            process_single_image(session, url, url_to_forbidden_status.get(url, True), initial_check_failed)
-            for url in request.photo_links
+        print(f"\n{'='*60}")
+        print(f"STEP 3: Processing censorship for forbidden images...")
+        print(f"{'='*60}")
+
+        # Step 3: Apply censorship for forbidden images
+        censorship_tasks = [
+            process_censorship_if_needed(
+                session,
+                img,
+                url_to_forbidden.get(img["uploaded_url"], True)
+            )
+            for img in uploaded_images
         ]
-        
-        results_with_none = await asyncio.gather(*tasks)
-        final_results = [result for result in results_with_none if result is not None]
+        final_results = await asyncio.gather(*censorship_tasks)
+
+        print(f"\n{'='*60}")
+        print(f"✓ COMPLETED: Processed {len(final_results)} images")
+        print(f"{'='*60}\n")
 
     return {"processed_images": final_results}
