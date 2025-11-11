@@ -260,10 +260,10 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
     raise HTTPException(status_code=500, detail=f"Censorship service returned unsuccessful response: {result_data}")
 
 
-async def censor_and_upload(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Dict[str, str]:
+async def censor_and_upload(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Optional[Dict[str, str]]:
     """
-    Apply full censorship and upload the censored image.
-    Simple single-step censorship (no progressive levels).
+    Apply full censorship, upload, and verify with revision service.
+    If still forbidden after censorship, returns None (image will be skipped).
     """
     print(f"  → Applying full censorship...")
 
@@ -274,9 +274,19 @@ async def censor_and_upload(session: httpx.AsyncClient, image_data: bytes, conte
     # Upload censored image
     print(f"  → Uploading censored image...")
     upload_result = await upload_image_to_basalam(session, censored_data)
-    print(f"  ✓ Uploaded to: {upload_result['url']}")
+    censored_url = upload_result['url']
+    print(f"  ✓ Uploaded to: {censored_url}")
 
-    return upload_result
+    # Verify with revision service
+    print(f"  → Verifying censored image with revision...")
+    is_still_forbidden = await check_single_image_revision_by_url(session, censored_url)
+
+    if is_still_forbidden:
+        print(f"  ✗ STILL FORBIDDEN after full censorship! Skipping this image.")
+        return None
+    else:
+        print(f"  ✓ Censored image is now ACCEPTABLE!")
+        return upload_result
 
 @async_retry()
 async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes) -> Dict[str, str]:
@@ -314,8 +324,11 @@ async def download_and_upload_original(session: httpx.AsyncClient, image_url: st
         return None
 
 
-async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: Dict, is_forbidden: bool, semaphore: asyncio.Semaphore) -> Dict[str, str]:
-    """Apply progressive censorship if image is forbidden. Uses semaphore to limit concurrent requests."""
+async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: Dict, is_forbidden: bool, semaphore: asyncio.Semaphore) -> Optional[Dict[str, str]]:
+    """
+    Apply full censorship if image is forbidden. Uses semaphore to limit concurrent requests.
+    Returns None if image is still forbidden after censorship (will be skipped).
+    """
     index = image_info["index"]
 
     if not is_forbidden:
@@ -327,18 +340,24 @@ async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: D
         print(f"[{index}] → Image is FORBIDDEN, applying full censorship...")
 
         try:
-            # Apply full censorship and upload
+            # Apply full censorship, upload, and verify
             upload_result = await censor_and_upload(
                 session,
                 image_info["image_data"],
                 image_info["content_type"]
             )
-            print(f"[{index}] ✓ SUCCESS! Censored and uploaded")
-            return upload_result
+
+            if upload_result is None:
+                # Image is still forbidden after censorship - skip it
+                print(f"[{index}] ✗ SKIPPED - still forbidden after censorship")
+                return None
+            else:
+                print(f"[{index}] ✓ SUCCESS! Censored and verified")
+                return upload_result
 
         except Exception as e:
-            print(f"[{index}] ⚠ Censorship failed: {e}, returning original")
-            return image_info["upload_result"]
+            print(f"[{index}] ⚠ Censorship failed: {e}, skipping image")
+            return None  # Skip problematic images instead of returning original
 
 
 # --- 5. تعریف Endpoint اصلی API (بدون تغییر) ---
@@ -415,10 +434,16 @@ async def process_images_endpoint(request: ImageProcessRequest):
             )
             for img in uploaded_images
         ]
-        final_results = await asyncio.gather(*censorship_tasks)
+        results_with_none = await asyncio.gather(*censorship_tasks)
 
+        # Filter out None results (skipped images that were still forbidden after censorship)
+        final_results = [result for result in results_with_none if result is not None]
+
+        skipped_count = len(results_with_none) - len(final_results)
         print(f"\n{'='*60}")
-        print(f"✓ COMPLETED: Processed {len(final_results)} images")
+        print(f"✓ COMPLETED: {len(final_results)} images processed successfully")
+        if skipped_count > 0:
+            print(f"⚠ SKIPPED: {skipped_count} images (still forbidden after censorship)")
         print(f"{'='*60}\n")
 
     return {"processed_images": final_results}
