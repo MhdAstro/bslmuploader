@@ -13,15 +13,18 @@ from typing import List, Dict, Optional, Any, Callable, Coroutine
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
 
-# Censorship retry settings (less retries since it's slow)
-CENSOR_MAX_RETRIES = 1  # Only try once since SafeImage is slow
+# Censorship retry settings with exponential backoff
+CENSOR_MAX_RETRIES = 3  # Increased to 3 retries for 502 errors
+CENSOR_RETRY_DELAY = 5  # Initial delay of 5 seconds
 CENSOR_TIMEOUT = 90  # 90 second timeout for censorship
 MAX_CENSORSHIP_ATTEMPTS = 3  # Maximum attempts to censor and verify
+MAX_CONCURRENT_CENSORSHIP = 2  # Limit concurrent censorship to avoid overwhelming SafeImage
 
 # ✨ --- دکوریتور جدید برای تلاش مجدد --- ✨
-def async_retry(max_retries: int = MAX_RETRIES, delay: int = RETRY_DELAY_SECONDS):
+def async_retry(max_retries: int = MAX_RETRIES, delay: int = RETRY_DELAY_SECONDS, exponential_backoff: bool = False):
     """
     A decorator to retry an async function if it raises an exception.
+    Supports exponential backoff for services that get overloaded.
     """
     def decorator(func: Callable[..., Coroutine[Any, Any, Any]]):
         @wraps(func)
@@ -33,9 +36,15 @@ def async_retry(max_retries: int = MAX_RETRIES, delay: int = RETRY_DELAY_SECONDS
                     if attempt == max_retries - 1:
                         print(f"ERROR: All {max_retries} retries failed for {func.__name__}. Re-raising exception.")
                         raise e  # Re-raise the last exception after all retries fail
-                    
-                    print(f"WARNING: Attempt {attempt + 1}/{max_retries} failed for {func.__name__}. Retrying...")
-                    await asyncio.sleep(delay)
+
+                    # Calculate delay with exponential backoff if enabled
+                    if exponential_backoff:
+                        wait_time = delay * (2 ** attempt)  # 5, 10, 20 seconds...
+                    else:
+                        wait_time = delay
+
+                    print(f"WARNING: Attempt {attempt + 1}/{max_retries} failed for {func.__name__}. Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
         return wrapper
     return decorator
 
@@ -185,7 +194,7 @@ async def check_single_image_revision_by_url(session: httpx.AsyncClient, image_u
         print(f"  WARNING: Unexpected error in revision check: {e}")
         return True  # Assume forbidden if check fails
 
-@async_retry(max_retries=CENSOR_MAX_RETRIES, delay=2)
+@async_retry(max_retries=CENSOR_MAX_RETRIES, delay=CENSOR_RETRY_DELAY, exponential_backoff=True)
 async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str],
                       blur_arms: bool = None, blur_legs: bool = None, blur_torso: bool = None) -> bytes:
     """
@@ -353,34 +362,36 @@ async def download_and_upload_original(session: httpx.AsyncClient, image_url: st
         return None
 
 
-async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: Dict, is_forbidden: bool) -> Dict[str, str]:
-    """Apply progressive censorship if image is forbidden."""
+async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: Dict, is_forbidden: bool, semaphore: asyncio.Semaphore) -> Dict[str, str]:
+    """Apply progressive censorship if image is forbidden. Uses semaphore to limit concurrent requests."""
     index = image_info["index"]
 
     if not is_forbidden:
         print(f"[{index}] ✓ Image is ACCEPTABLE, no censorship needed")
         return image_info["upload_result"]
 
-    print(f"[{index}] → Image is FORBIDDEN, applying progressive censorship...")
+    # Use semaphore to limit concurrent censorship requests
+    async with semaphore:
+        print(f"[{index}] → Image is FORBIDDEN, applying progressive censorship...")
 
-    try:
-        # Use progressive censorship with verification loop
-        upload_result = await censor_with_verification(
-            session,
-            image_info["image_data"],
-            image_info["content_type"]
-        )
+        try:
+            # Use progressive censorship with verification loop
+            upload_result = await censor_with_verification(
+                session,
+                image_info["image_data"],
+                image_info["content_type"]
+            )
 
-        if upload_result:
-            print(f"[{index}] ✓ SUCCESS! Censored and verified")
-            return upload_result
-        else:
-            print(f"[{index}] ⚠ All censorship attempts failed, returning original")
+            if upload_result:
+                print(f"[{index}] ✓ SUCCESS! Censored and verified")
+                return upload_result
+            else:
+                print(f"[{index}] ⚠ All censorship attempts failed, returning original")
+                return image_info["upload_result"]
+
+        except Exception as e:
+            print(f"[{index}] ⚠ Censorship error: {e}, returning original")
             return image_info["upload_result"]
-
-    except Exception as e:
-        print(f"[{index}] ⚠ Censorship error: {e}, returning original")
-        return image_info["upload_result"]
 
 
 # --- 5. تعریف Endpoint اصلی API (بدون تغییر) ---
@@ -441,14 +452,19 @@ async def process_images_endpoint(request: ImageProcessRequest):
 
         print(f"\n{'='*60}")
         print(f"STEP 3: Processing censorship for forbidden images...")
+        print(f"Maximum {MAX_CONCURRENT_CENSORSHIP} concurrent censorship requests")
         print(f"{'='*60}")
 
-        # Step 3: Apply censorship for forbidden images
+        # Step 3: Apply censorship for forbidden images with limited concurrency
+        # Create semaphore to limit concurrent SafeImage requests
+        censorship_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CENSORSHIP)
+
         censorship_tasks = [
             process_censorship_if_needed(
                 session,
                 img,
-                url_to_forbidden.get(img["uploaded_url"], True)
+                url_to_forbidden.get(img["uploaded_url"], True),
+                censorship_semaphore
             )
             for img in uploaded_images
         ]
