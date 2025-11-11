@@ -14,10 +14,9 @@ MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1
 
 # Censorship retry settings with exponential backoff
-CENSOR_MAX_RETRIES = 3  # Increased to 3 retries for 502 errors
-CENSOR_RETRY_DELAY = 5  # Initial delay of 5 seconds
+CENSOR_MAX_RETRIES = 2  # 2 retries for 502 errors
+CENSOR_RETRY_DELAY = 3  # Initial delay of 3 seconds
 CENSOR_TIMEOUT = 90  # 90 second timeout for censorship
-MAX_CENSORSHIP_ATTEMPTS = 3  # Maximum attempts to censor and verify
 MAX_CONCURRENT_CENSORSHIP = 2  # Limit concurrent censorship to avoid overwhelming SafeImage
 
 # ✨ --- دکوریتور جدید برای تلاش مجدد --- ✨
@@ -55,16 +54,16 @@ class Settings(BaseSettings):
     basalam_upload_token: str
     revision_api_token: str
 
-    # SafeImage censorship parameters (optimized for speed)
+    # SafeImage censorship parameters (full censorship)
     safeimage_sigma_blur: str = "25"
     safeimage_feather: str = "5"
     safeimage_show_mask: str = "false"  # Disabled to reduce response size
     safeimage_only_clothes: str = "false"
     safeimage_blur_face: str = "true"
     safeimage_blur_hair: str = "true"
-    safeimage_blur_arms: str = "false"  # Disabled for faster processing
-    safeimage_blur_legs: str = "false"  # Disabled for faster processing
-    safeimage_blur_torso: str = "false"
+    safeimage_blur_arms: str = "true"  # Enabled for full censorship
+    safeimage_blur_legs: str = "true"  # Enabled for full censorship
+    safeimage_blur_torso: str = "true"  # Enabled for full censorship
 
 settings = Settings()
 
@@ -195,20 +194,14 @@ async def check_single_image_revision_by_url(session: httpx.AsyncClient, image_u
         return True  # Assume forbidden if check fails
 
 @async_retry(max_retries=CENSOR_MAX_RETRIES, delay=CENSOR_RETRY_DELAY, exponential_backoff=True)
-async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str],
-                      blur_arms: bool = None, blur_legs: bool = None, blur_torso: bool = None) -> bytes:
+async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> bytes:
     """
-    Sends an image to the censorship service with configurable blur parameters.
-    Allows overriding specific blur settings for progressive censorship.
+    Applies full censorship to an image using SafeImage service.
+    Blurs: face, hair, arms, legs, and torso.
     """
     url = "https://safeimage.adminai.ir/process"
 
-    # Use provided parameters or fall back to settings
-    use_blur_arms = blur_arms if blur_arms is not None else settings.safeimage_blur_arms == "true"
-    use_blur_legs = blur_legs if blur_legs is not None else settings.safeimage_blur_legs == "true"
-    use_blur_torso = blur_torso if blur_torso is not None else settings.safeimage_blur_torso == "true"
-
-    # Prepare form data with all SafeImage parameters matching the curl request
+    # Prepare form data with all SafeImage parameters (full censorship)
     form_data = {
         "sigma_blur": settings.safeimage_sigma_blur,
         "feather": settings.safeimage_feather,
@@ -216,9 +209,9 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
         "only_clothes": settings.safeimage_only_clothes,
         "blur_face": settings.safeimage_blur_face,
         "blur_hair": settings.safeimage_blur_hair,
-        "blur_arms": "true" if use_blur_arms else "false",
-        "blur_legs": "true" if use_blur_legs else "false",
-        "blur_torso": "true" if use_blur_torso else "false",
+        "blur_arms": settings.safeimage_blur_arms,
+        "blur_legs": settings.safeimage_blur_legs,
+        "blur_torso": settings.safeimage_blur_torso,
     }
 
     # Prepare image file with proper content type
@@ -267,64 +260,23 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
     raise HTTPException(status_code=500, detail=f"Censorship service returned unsuccessful response: {result_data}")
 
 
-async def censor_with_verification(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Optional[Dict[str, str]]:
+async def censor_and_upload(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Dict[str, str]:
     """
-    Progressive censorship with verification loop.
-    Tries multiple censorship levels until the image is acceptable or max attempts reached.
-
-    Censorship Levels:
-    - Level 1: Face + Hair only (fast)
-    - Level 2: Face + Hair + Arms + Legs (moderate)
-    - Level 3: Face + Hair + Arms + Legs + Torso (strict, everything)
-
-    Returns upload result dict {"id": ..., "url": ...} if successful, None if all attempts failed.
+    Apply full censorship and upload the censored image.
+    Simple single-step censorship (no progressive levels).
     """
+    print(f"  → Applying full censorship...")
 
-    censorship_levels = [
-        {"name": "Level 1 (Face + Hair)", "blur_arms": False, "blur_legs": False, "blur_torso": False},
-        {"name": "Level 2 (+ Arms + Legs)", "blur_arms": True, "blur_legs": True, "blur_torso": False},
-        {"name": "Level 3 (+ Torso - Everything)", "blur_arms": True, "blur_legs": True, "blur_torso": True},
-    ]
+    # Apply full censorship
+    censored_data = await censor_image(session, image_data, content_type)
+    print(f"  ✓ Censorship applied (size: {len(censored_data)} bytes)")
 
-    for attempt, level in enumerate(censorship_levels, 1):
-        try:
-            print(f"  Attempt {attempt}/{len(censorship_levels)}: Applying {level['name']}...")
+    # Upload censored image
+    print(f"  → Uploading censored image...")
+    upload_result = await upload_image_to_basalam(session, censored_data)
+    print(f"  ✓ Uploaded to: {upload_result['url']}")
 
-            # Apply censorship with current level
-            censored_data = await censor_image(
-                session, image_data, content_type,
-                blur_arms=level['blur_arms'],
-                blur_legs=level['blur_legs'],
-                blur_torso=level['blur_torso']
-            )
-
-            print(f"  ✓ Censorship applied successfully (size: {len(censored_data)} bytes)")
-
-            # Upload censored image to get URL for verification
-            print(f"  → Uploading censored image to get URL for verification...")
-            upload_result = await upload_image_to_basalam(session, censored_data)
-            censored_url = upload_result["url"]
-            print(f"  ✓ Uploaded to: {censored_url}")
-
-            # Verify with revision service using URL (avoids 413 error)
-            print(f"  → Checking censored image with revision service...")
-            is_forbidden = await check_single_image_revision_by_url(session, censored_url)
-
-            if not is_forbidden:
-                print(f"  ✓ SUCCESS! Censored image is now acceptable!")
-                return upload_result  # Return the upload result
-            else:
-                print(f"  ✗ Still forbidden after {level['name']}, trying stricter level...")
-                # Note: Previously uploaded image stays on server (acceptable trade-off)
-
-        except Exception as e:
-            print(f"  ✗ Censorship {level['name']} failed: {e}")
-            if attempt == len(censorship_levels):
-                print(f"  All censorship attempts exhausted")
-                return None
-
-    print(f"  WARNING: All censorship levels tried, image still forbidden")
-    return None
+    return upload_result
 
 @async_retry()
 async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes) -> Dict[str, str]:
@@ -372,25 +324,20 @@ async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: D
 
     # Use semaphore to limit concurrent censorship requests
     async with semaphore:
-        print(f"[{index}] → Image is FORBIDDEN, applying progressive censorship...")
+        print(f"[{index}] → Image is FORBIDDEN, applying full censorship...")
 
         try:
-            # Use progressive censorship with verification loop
-            upload_result = await censor_with_verification(
+            # Apply full censorship and upload
+            upload_result = await censor_and_upload(
                 session,
                 image_info["image_data"],
                 image_info["content_type"]
             )
-
-            if upload_result:
-                print(f"[{index}] ✓ SUCCESS! Censored and verified")
-                return upload_result
-            else:
-                print(f"[{index}] ⚠ All censorship attempts failed, returning original")
-                return image_info["upload_result"]
+            print(f"[{index}] ✓ SUCCESS! Censored and uploaded")
+            return upload_result
 
         except Exception as e:
-            print(f"[{index}] ⚠ Censorship error: {e}, returning original")
+            print(f"[{index}] ⚠ Censorship failed: {e}, returning original")
             return image_info["upload_result"]
 
 
