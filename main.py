@@ -194,18 +194,26 @@ async def check_single_image_revision_by_url(session: httpx.AsyncClient, image_u
         return True  # Assume forbidden if check fails
 
 @async_retry(max_retries=CENSOR_MAX_RETRIES, delay=CENSOR_RETRY_DELAY, exponential_backoff=True)
-async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> bytes:
+async def censor_images_batch(session: httpx.AsyncClient, images_data: List[tuple[bytes, Optional[str]]]) -> List[Optional[bytes]]:
     """
-    Applies full censorship to an image using SafeImage service.
+    Applies full censorship to multiple images using SafeImage batch service.
     Blurs: face, hair, arms, legs, and torso.
+    
+    Args:
+        images_data: List of tuples (image_bytes, content_type)
+    
+    Returns:
+        List of censored image bytes (None if censorship failed for that image)
     """
-    url = "https://safeimage.adminai.ir/process"
+    if not images_data:
+        return []
+    
+    url = "https://safeimage.adminai.ir/process-batch"
 
     # Prepare form data with all SafeImage parameters (full censorship)
     form_data = {
         "sigma_blur": settings.safeimage_sigma_blur,
         "feather": settings.safeimage_feather,
-        "show_mask": settings.safeimage_show_mask,
         "only_clothes": settings.safeimage_only_clothes,
         "blur_face": settings.safeimage_blur_face,
         "blur_hair": settings.safeimage_blur_hair,
@@ -214,8 +222,10 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
         "blur_torso": settings.safeimage_blur_torso,
     }
 
-    # Prepare image file with proper content type
-    files = {"image": ("image.jpg", image_data, content_type or "image/jpeg")}
+    # Prepare multiple image files
+    files = []
+    for idx, (image_data, content_type) in enumerate(images_data):
+        files.append(("images", (f"image_{idx}.jpg", image_data, content_type or "image/jpeg")))
 
     # Add headers similar to the curl request
     headers = {
@@ -226,67 +236,112 @@ async def censor_image(session: httpx.AsyncClient, image_data: bytes, content_ty
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
 
-    # Send request to SafeImage service with extended timeout
-    print(f"DEBUG: Sending image to SafeImage (size: {len(image_data)} bytes)...")
+    # Send batch request to SafeImage service with extended timeout
+    total_size = sum(len(img[0]) for img in images_data)
+    print(f"DEBUG: Sending {len(images_data)} images to SafeImage batch API (total size: {total_size} bytes)...")
     response = await session.post(url, data=form_data, files=files, headers=headers, timeout=CENSOR_TIMEOUT)
-    print(f"DEBUG: SafeImage responded with status {response.status_code}")
+    print(f"DEBUG: SafeImage batch API responded with status {response.status_code}")
     response.raise_for_status()
 
-    # Parse response according to the actual structure
+    # Parse batch response
     result_data = response.json()
 
-    if result_data.get("success") is True and "blurred_image" in result_data:
-        blurred_image = result_data["blurred_image"]
+    if not result_data.get("success"):
+        raise HTTPException(status_code=500, detail=f"Batch censorship failed: {result_data}")
+
+    # Extract censored images from results
+    results = result_data.get("results", [])
+    censored_images = []
+    
+    for idx, result in enumerate(results):
+        if not result.get("success"):
+            print(f"WARNING: Image {idx} censorship failed in batch")
+            censored_images.append(None)
+            continue
+            
+        blurred_image = result.get("blurred_image")
+        if not blurred_image:
+            print(f"WARNING: No blurred_image for image {idx}")
+            censored_images.append(None)
+            continue
 
         # Handle base64 with or without data URI prefix
         if blurred_image.startswith("data:"):
-            # Remove data URI prefix (e.g., "data:image/jpeg;base64,")
             base64_image_str = blurred_image.split(',', 1)[1]
         else:
             base64_image_str = blurred_image
 
-        # Decode base64 to bytes (handle padding if needed)
+        # Decode base64 to bytes
         try:
-            # Add padding if necessary
             missing_padding = len(base64_image_str) % 4
             if missing_padding:
                 base64_image_str += '=' * (4 - missing_padding)
-            return base64.b64decode(base64_image_str)
+            censored_images.append(base64.b64decode(base64_image_str))
         except Exception as e:
-            print(f"ERROR: Failed to decode base64 image from SafeImage. Error: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to decode censored image: {e}")
+            print(f"ERROR: Failed to decode base64 for image {idx}: {e}")
+            censored_images.append(None)
 
-    # If success is False or blurred_image is missing
-    raise HTTPException(status_code=500, detail=f"Censorship service returned unsuccessful response: {result_data}")
+    print(f"DEBUG: Successfully censored {sum(1 for img in censored_images if img is not None)}/{len(images_data)} images")
+    return censored_images
 
 
-async def censor_and_upload(session: httpx.AsyncClient, image_data: bytes, content_type: Optional[str]) -> Optional[Dict[str, str]]:
+async def censor_and_upload_batch(session: httpx.AsyncClient, images_info: List[Dict]) -> List[Optional[Dict[str, str]]]:
     """
-    Apply full censorship, upload, and verify with revision service.
-    If still forbidden after censorship, returns None (image will be skipped).
+    Apply full censorship to multiple images in batch, upload, and verify with revision service.
+    If still forbidden after censorship, returns None for that image (will be skipped).
+    
+    Args:
+        images_info: List of dicts with 'image_data', 'content_type', 'index'
+    
+    Returns:
+        List of upload results (None for failed/forbidden images)
     """
-    print(f"  → Applying full censorship...")
+    if not images_info:
+        return []
+    
+    print(f"  → Applying batch censorship to {len(images_info)} images...")
 
-    # Apply full censorship
-    censored_data = await censor_image(session, image_data, content_type)
-    print(f"  ✓ Censorship applied (size: {len(censored_data)} bytes)")
+    # Prepare batch data
+    images_data = [(info["image_data"], info["content_type"]) for info in images_info]
+    
+    # Apply batch censorship
+    censored_images = await censor_images_batch(session, images_data)
+    print(f"  ✓ Batch censorship completed")
 
-    # Upload censored image
-    print(f"  → Uploading censored image...")
-    upload_result = await upload_image_to_basalam(session, censored_data)
-    censored_url = upload_result['url']
-    print(f"  ✓ Uploaded to: {censored_url}")
+    # Upload and verify each censored image
+    results = []
+    for idx, (info, censored_data) in enumerate(zip(images_info, censored_images)):
+        image_idx = info["index"]
+        
+        if censored_data is None:
+            print(f"  [{image_idx}] ✗ Censorship failed, skipping")
+            results.append(None)
+            continue
+        
+        print(f"  [{image_idx}] ✓ Censored (size: {len(censored_data)} bytes)")
 
-    # Verify with revision service
-    print(f"  → Verifying censored image with revision...")
-    is_still_forbidden = await check_single_image_revision_by_url(session, censored_url)
+        # Upload censored image
+        try:
+            print(f"  [{image_idx}] → Uploading censored image...")
+            upload_result = await upload_image_to_basalam(session, censored_data)
+            censored_url = upload_result['url']
+            print(f"  [{image_idx}] ✓ Uploaded to: {censored_url}")
 
-    if is_still_forbidden:
-        print(f"  ✗ STILL FORBIDDEN after full censorship! Skipping this image.")
-        return None
-    else:
-        print(f"  ✓ Censored image is now ACCEPTABLE!")
-        return upload_result
+            # Verify with revision service
+            print(f"  [{image_idx}] → Verifying censored image...")
+            is_still_forbidden = await check_single_image_revision_by_url(session, censored_url)
+
+            if is_still_forbidden:
+                print(f"  [{image_idx}] ✗ STILL FORBIDDEN after censorship! Skipping.")
+                results.append(None)
+            else:
+                print(f"  [{image_idx}] ✓ Censored image is ACCEPTABLE!")
+                results.append(upload_result)
+        except Exception as e:
+            print(f"  [{image_idx}] ✗ Upload/verify failed: {e}")
+            results.append(None)
+
+    return results
 
 @async_retry()
 async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes) -> Dict[str, str]:
@@ -324,40 +379,31 @@ async def download_and_upload_original(session: httpx.AsyncClient, image_url: st
         return None
 
 
-async def process_censorship_if_needed(session: httpx.AsyncClient, image_info: Dict, is_forbidden: bool, semaphore: asyncio.Semaphore) -> Optional[Dict[str, str]]:
+async def process_censorship_batch(session: httpx.AsyncClient, forbidden_images: List[Dict]) -> List[Optional[Dict[str, str]]]:
     """
-    Apply full censorship if image is forbidden. Uses semaphore to limit concurrent requests.
-    Returns None if image is still forbidden after censorship (will be skipped).
+    Apply batch censorship to all forbidden images at once.
+    Returns list of upload results (None for failed/forbidden images).
     """
-    index = image_info["index"]
+    if not forbidden_images:
+        return []
+    
+    print(f"\n{'='*60}")
+    print(f"Processing {len(forbidden_images)} FORBIDDEN images with batch censorship...")
+    print(f"{'='*60}")
 
-    if not is_forbidden:
-        print(f"[{index}] ✓ Image is ACCEPTABLE, no censorship needed")
-        return image_info["upload_result"]
+    try:
+        # Apply batch censorship, upload, and verify
+        results = await censor_and_upload_batch(session, forbidden_images)
+        
+        success_count = sum(1 for r in results if r is not None)
+        print(f"\n✓ Batch censorship completed: {success_count}/{len(forbidden_images)} images acceptable")
+        
+        return results
 
-    # Use semaphore to limit concurrent censorship requests
-    async with semaphore:
-        print(f"[{index}] → Image is FORBIDDEN, applying full censorship...")
-
-        try:
-            # Apply full censorship, upload, and verify
-            upload_result = await censor_and_upload(
-                session,
-                image_info["image_data"],
-                image_info["content_type"]
-            )
-
-            if upload_result is None:
-                # Image is still forbidden after censorship - skip it
-                print(f"[{index}] ✗ SKIPPED - still forbidden after censorship")
-                return None
-            else:
-                print(f"[{index}] ✓ SUCCESS! Censored and verified")
-                return upload_result
-
-        except Exception as e:
-            print(f"[{index}] ⚠ Censorship failed: {e}, skipping image")
-            return None  # Skip problematic images instead of returning original
+    except Exception as e:
+        print(f"\n✗ Batch censorship failed: {e}")
+        print(f"→ Skipping all {len(forbidden_images)} forbidden images")
+        return [None] * len(forbidden_images)
 
 
 # --- 5. تعریف Endpoint اصلی API (بدون تغییر) ---
@@ -418,23 +464,28 @@ async def process_images_endpoint(request: ImageProcessRequest):
 
         print(f"\n{'='*60}")
         print(f"STEP 3: Processing censorship for forbidden images...")
-        print(f"Maximum {MAX_CONCURRENT_CENSORSHIP} concurrent censorship requests")
+        print(f"Using BATCH API for all forbidden images at once")
         print(f"{'='*60}")
 
-        # Step 3: Apply censorship for forbidden images with limited concurrency
-        # Create semaphore to limit concurrent SafeImage requests
-        censorship_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CENSORSHIP)
+        # Step 3: Separate acceptable and forbidden images
+        acceptable_images = []
+        forbidden_images = []
+        
+        for img in uploaded_images:
+            is_forbidden = url_to_forbidden.get(img["uploaded_url"], True)
+            if is_forbidden:
+                forbidden_images.append(img)
+            else:
+                acceptable_images.append(img["upload_result"])
+        
+        print(f"→ {len(acceptable_images)} images are ACCEPTABLE (no censorship needed)")
+        print(f"→ {len(forbidden_images)} images are FORBIDDEN (need batch censorship)")
 
-        censorship_tasks = [
-            process_censorship_if_needed(
-                session,
-                img,
-                url_to_forbidden.get(img["uploaded_url"], True),
-                censorship_semaphore
-            )
-            for img in uploaded_images
-        ]
-        results_with_none = await asyncio.gather(*censorship_tasks)
+        # Apply batch censorship to all forbidden images at once
+        censored_results = await process_censorship_batch(session, forbidden_images)
+        
+        # Combine acceptable and censored results
+        results_with_none = acceptable_images + censored_results
 
         # Filter out None results (skipped images that were still forbidden after censorship)
         final_results = [result for result in results_with_none if result is not None]
