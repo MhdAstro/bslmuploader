@@ -320,10 +320,11 @@ async def censor_and_upload_batch(session: httpx.AsyncClient, images_info: List[
         
         print(f"  [{image_idx}] ✓ Censored (size: {len(censored_data)} bytes)")
 
-        # Upload censored image
+        # Upload censored image (SafeImage returns PNG format)
         try:
-            print(f"  [{image_idx}] → Uploading censored image...")
-            upload_result = await upload_image_to_basalam(session, censored_data)
+            print(f"  [{image_idx}] → Uploading censored image (PNG format)...")
+            # Upload as PNG since SafeImage returns PNG
+            upload_result = await upload_image_to_basalam(session, censored_data, content_type="image/png")
             censored_url = upload_result['url']
             print(f"  [{image_idx}] ✓ Uploaded to: {censored_url}")
 
@@ -344,12 +345,22 @@ async def censor_and_upload_batch(session: httpx.AsyncClient, images_info: List[
     return results
 
 @async_retry()
-async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes) -> Dict[str, str]:
-    """تصویر نهایی را آپلود می‌کند."""
-    # ... (کد داخلی این تابع بدون تغییر باقی می‌ماند)
+async def upload_image_to_basalam(session: httpx.AsyncClient, image_data: bytes, content_type: str = "image/jpeg") -> Dict[str, str]:
+    """
+    تصویر نهایی را آپلود می‌کند.
+    
+    Args:
+        image_data: بایت‌های تصویر
+        content_type: نوع محتوا (image/jpeg یا image/png)
+    """
     url = "https://uploadio.basalam.com/v3/files"
     headers = {"authorization": f"{settings.basalam_upload_token}"}
-    files = {"file": ("image.jpg", image_data, "image/jpeg")}
+    
+    # Determine file extension based on content type
+    file_ext = "png" if "png" in content_type.lower() else "jpg"
+    filename = f"image.{file_ext}"
+    
+    files = {"file": (filename, image_data, content_type)}
     form_data = {"file_type": "product.photo"}
     response = await session.post(url, headers=headers, files=files, data=form_data, timeout=45.0)
     response.raise_for_status()
@@ -363,9 +374,10 @@ async def download_and_upload_original(session: httpx.AsyncClient, image_url: st
     try:
         print(f"[{index}] Downloading and uploading: {image_url}")
         image_data, content_type = await download_image(session, image_url)
-        upload_result = await upload_image_to_basalam(session, image_data)
+        # Upload with original content type to preserve quality
+        upload_result = await upload_image_to_basalam(session, image_data, content_type=content_type)
 
-        print(f"[{index}] ✓ Uploaded: {upload_result['url']}")
+        print(f"[{index}] ✓ Uploaded: {upload_result['url']} (type: {content_type})")
         return {
             "index": index,
             "original_temp_url": image_url,
