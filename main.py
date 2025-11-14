@@ -354,11 +354,13 @@ async def censor_and_upload_batch(session: httpx.AsyncClient, images_info: List[
     revision_results = await check_images_revision(session, level1_urls)
     print(f"  ✓ Level 1 batch revision check completed")
     
-    # Map revision results
-    url_to_forbidden = {
-        result['url']: result.get('is_forbidden', True)
-        for result in revision_results
-    }
+    # Map revision results by file_id (index in the list)
+    url_to_forbidden = {}
+    for result in revision_results:
+        file_id = result.get('file_id')
+        if file_id is not None and file_id < len(level1_urls):
+            url = level1_urls[file_id]
+            url_to_forbidden[url] = result.get('is_forbidden', True)
     
     # Separate acceptable and forbidden
     acceptable_results = []
@@ -408,10 +410,13 @@ async def censor_and_upload_batch(session: httpx.AsyncClient, images_info: List[
             level2_revision = await check_images_revision(session, level2_urls)
             print(f"  ✓ Level 2 batch revision check completed")
             
-            level2_url_to_forbidden = {
-                result['url']: result.get('is_forbidden', True)
-                for result in level2_revision
-            }
+            # Map Level 2 revision results by file_id
+            level2_url_to_forbidden = {}
+            for result in level2_revision:
+                file_id = result.get('file_id')
+                if file_id is not None and file_id < len(level2_urls):
+                    url = level2_urls[file_id]
+                    level2_url_to_forbidden[url] = result.get('is_forbidden', True)
             
             # Process Level 2 results
             for (item, _), upload in zip(valid_level2, level2_uploads):
