@@ -286,122 +286,160 @@ async def censor_images_batch(session: httpx.AsyncClient, images_data: List[tupl
     return censored_images
 
 
+async def upload_images_batch(session: httpx.AsyncClient, images_data: List[tuple[bytes, str]]) -> List[Optional[Dict[str, str]]]:
+    """
+    Upload multiple images in parallel (no batch API available for upload).
+    
+    Args:
+        images_data: List of tuples (image_bytes, content_type)
+    
+    Returns:
+        List of upload results
+    """
+    upload_tasks = [
+        upload_image_to_basalam(session, img_data, content_type)
+        for img_data, content_type in images_data
+    ]
+    results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+    
+    # Convert exceptions to None
+    return [result if not isinstance(result, Exception) else None for result in results]
+
+
 async def censor_and_upload_batch(session: httpx.AsyncClient, images_info: List[Dict]) -> List[Optional[Dict[str, str]]]:
     """
-    Apply full censorship to multiple images in batch, upload, and verify with revision service.
-    Uses two-level censorship:
-    1. First attempt: Normal censorship (sigma_blur=25)
-    2. If still forbidden: Stricter censorship (sigma_blur=30) on already censored image
-    3. If still forbidden: Upload the censored image anyway
+    Fully optimized batch processing with minimal requests:
+    1. Batch censor Level 1 (sigma=25)
+    2. Batch upload all Level 1 censored images
+    3. Batch check all with revision
+    4. For forbidden: Batch censor Level 2 (sigma=30)
+    5. Batch upload Level 2 censored images
+    6. Batch check Level 2 with revision
+    7. Upload any still forbidden images anyway
     
     Args:
         images_info: List of dicts with 'image_data', 'content_type', 'index'
     
     Returns:
-        List of upload results (None for failed/forbidden images)
+        List of upload results
     """
     if not images_info:
         return []
     
-    print(f"  → Applying LEVEL 1 batch censorship to {len(images_info)} images (sigma_blur=25)...")
-
-    # Prepare batch data
+    # === LEVEL 1: Batch Censorship ===
+    print(f"  → LEVEL 1: Batch censoring {len(images_info)} images (sigma_blur=25)...")
     images_data = [(info["image_data"], info["content_type"]) for info in images_info]
-    
-    # Apply Level 1 batch censorship
-    censored_images = await censor_images_batch(session, images_data, sigma_blur="25")
+    level1_censored = await censor_images_batch(session, images_data, sigma_blur="25")
     print(f"  ✓ Level 1 batch censorship completed")
 
-    # Upload and verify each censored image
-    results = []
-    images_needing_level2 = []  # Track images that need stricter censorship
+    # Filter out failed censorships
+    valid_level1 = [
+        (info, censored) for info, censored in zip(images_info, level1_censored)
+        if censored is not None
+    ]
     
-    for idx, (info, censored_data) in enumerate(zip(images_info, censored_images)):
-        image_idx = info["index"]
-        
-        if censored_data is None:
-            print(f"  [{image_idx}] ✗ Level 1 censorship failed, skipping")
-            results.append(None)
+    if not valid_level1:
+        print(f"  ✗ All Level 1 censorships failed")
+        return [None] * len(images_info)
+    
+    # === LEVEL 1: Batch Upload ===
+    print(f"  → LEVEL 1: Batch uploading {len(valid_level1)} censored images...")
+    level1_upload_data = [(censored, "image/png") for _, censored in valid_level1]
+    level1_uploads = await upload_images_batch(session, level1_upload_data)
+    print(f"  ✓ Level 1 batch upload completed")
+    
+    # === LEVEL 1: Batch Revision Check ===
+    level1_urls = [upload['url'] for upload in level1_uploads if upload is not None]
+    print(f"  → LEVEL 1: Batch checking {len(level1_urls)} images with revision...")
+    revision_results = await check_images_revision(session, level1_urls)
+    print(f"  ✓ Level 1 batch revision check completed")
+    
+    # Map revision results
+    url_to_forbidden = {
+        result['url']: result.get('is_forbidden', True)
+        for result in revision_results
+    }
+    
+    # Separate acceptable and forbidden
+    acceptable_results = []
+    forbidden_for_level2 = []
+    
+    for (info, _), upload in zip(valid_level1, level1_uploads):
+        if upload is None:
             continue
+            
+        is_forbidden = url_to_forbidden.get(upload['url'], True)
         
-        print(f"  [{image_idx}] ✓ Level 1 censored (size: {len(censored_data)} bytes)")
-
-        # Upload censored image (SafeImage returns PNG format)
-        try:
-            print(f"  [{image_idx}] → Uploading Level 1 censored image...")
-            upload_result = await upload_image_to_basalam(session, censored_data, content_type="image/png")
-            censored_url = upload_result['url']
-            print(f"  [{image_idx}] ✓ Uploaded to: {censored_url}")
-
-            # Verify with revision service
-            print(f"  [{image_idx}] → Verifying Level 1 censored image...")
-            is_still_forbidden = await check_single_image_revision_by_url(session, censored_url)
-
-            if is_still_forbidden:
-                print(f"  [{image_idx}] ⚠ STILL FORBIDDEN after Level 1! Will try Level 2...")
-                # Store for Level 2 processing - use ORIGINAL image with stricter settings
-                images_needing_level2.append({
-                    "index": image_idx,
-                    "original_data": info["image_data"],  # Use ORIGINAL image for Level 2
-                    "original_content_type": info["content_type"],
-                    "level1_upload": upload_result
-                })
-                results.append(None)  # Placeholder, will be replaced
-            else:
-                print(f"  [{image_idx}] ✓ Level 1 censored image is ACCEPTABLE!")
-                results.append(upload_result)
-        except Exception as e:
-            print(f"  [{image_idx}] ✗ Upload/verify failed: {e}")
-            results.append(None)
-
-    # Apply Level 2 censorship if needed
-    if images_needing_level2:
-        print(f"\n  → Applying LEVEL 2 batch censorship to {len(images_needing_level2)} images (sigma_blur=30)...")
-        
-        # Prepare Level 2 batch data (using ORIGINAL images with stricter settings)
-        level2_images_data = [(img["original_data"], img["original_content_type"]) for img in images_needing_level2]
-        
-        # Apply Level 2 stricter censorship on ORIGINAL images
+        if is_forbidden:
+            print(f"  [{info['index']}] ⚠ FORBIDDEN after Level 1, needs Level 2")
+            forbidden_for_level2.append({
+                'info': info,
+                'level1_upload': upload
+            })
+        else:
+            print(f"  [{info['index']}] ✓ ACCEPTABLE after Level 1")
+            acceptable_results.append((info['index'], upload))
+    
+    # === LEVEL 2: Process Forbidden Images ===
+    if forbidden_for_level2:
+        print(f"\n  → LEVEL 2: Batch censoring {len(forbidden_for_level2)} images (sigma_blur=30)...")
+        level2_images_data = [
+            (item['info']['image_data'], item['info']['content_type'])
+            for item in forbidden_for_level2
+        ]
         level2_censored = await censor_images_batch(session, level2_images_data, sigma_blur="30")
         print(f"  ✓ Level 2 batch censorship completed")
         
-        # Upload and verify Level 2 results
-        for img_info, level2_data in zip(images_needing_level2, level2_censored):
-            image_idx = img_info["index"]
+        # === LEVEL 2: Batch Upload ===
+        valid_level2 = [
+            (item, censored) for item, censored in zip(forbidden_for_level2, level2_censored)
+            if censored is not None
+        ]
+        
+        if valid_level2:
+            print(f"  → LEVEL 2: Batch uploading {len(valid_level2)} censored images...")
+            level2_upload_data = [(censored, "image/png") for _, censored in valid_level2]
+            level2_uploads = await upload_images_batch(session, level2_upload_data)
+            print(f"  ✓ Level 2 batch upload completed")
             
-            if level2_data is None:
-                print(f"  [{image_idx}] ⚠ Level 2 censorship failed, using Level 1 result")
-                # Use Level 1 result
-                result_idx = next(i for i, info in enumerate(images_info) if info["index"] == image_idx)
-                results[result_idx] = img_info["level1_upload"]
-                continue
+            # === LEVEL 2: Batch Revision Check ===
+            level2_urls = [upload['url'] for upload in level2_uploads if upload is not None]
+            print(f"  → LEVEL 2: Batch checking {len(level2_urls)} images with revision...")
+            level2_revision = await check_images_revision(session, level2_urls)
+            print(f"  ✓ Level 2 batch revision check completed")
             
-            print(f"  [{image_idx}] ✓ Level 2 censored (size: {len(level2_data)} bytes)")
+            level2_url_to_forbidden = {
+                result['url']: result.get('is_forbidden', True)
+                for result in level2_revision
+            }
             
-            try:
-                print(f"  [{image_idx}] → Uploading Level 2 censored image...")
-                level2_upload = await upload_image_to_basalam(session, level2_data, content_type="image/png")
-                level2_url = level2_upload['url']
-                print(f"  [{image_idx}] ✓ Uploaded to: {level2_url}")
+            # Process Level 2 results
+            for (item, _), upload in zip(valid_level2, level2_uploads):
+                if upload is None:
+                    # Use Level 1 result
+                    acceptable_results.append((item['info']['index'], item['level1_upload']))
+                    continue
                 
-                # Verify Level 2
-                print(f"  [{image_idx}] → Verifying Level 2 censored image...")
-                is_still_forbidden = await check_single_image_revision_by_url(session, level2_url)
+                is_still_forbidden = level2_url_to_forbidden.get(upload['url'], True)
                 
                 if is_still_forbidden:
-                    print(f"  [{image_idx}] ⚠ STILL FORBIDDEN after Level 2! Uploading anyway...")
-                    # Upload the Level 2 censored image anyway
-                    result_idx = next(i for i, info in enumerate(images_info) if info["index"] == image_idx)
-                    results[result_idx] = level2_upload
+                    print(f"  [{item['info']['index']}] ⚠ STILL FORBIDDEN after Level 2, uploading anyway")
                 else:
-                    print(f"  [{image_idx}] ✓ Level 2 censored image is ACCEPTABLE!")
-                    result_idx = next(i for i, info in enumerate(images_info) if info["index"] == image_idx)
-                    results[result_idx] = level2_upload
-            except Exception as e:
-                print(f"  [{image_idx}] ✗ Level 2 upload/verify failed: {e}, using Level 1 result")
-                result_idx = next(i for i, info in enumerate(images_info) if info["index"] == image_idx)
-                results[result_idx] = img_info["level1_upload"]
-
+                    print(f"  [{item['info']['index']}] ✓ ACCEPTABLE after Level 2")
+                
+                acceptable_results.append((item['info']['index'], upload))
+        else:
+            # All Level 2 censorships failed, use Level 1 results
+            for item in forbidden_for_level2:
+                print(f"  [{item['info']['index']}] ⚠ Level 2 failed, using Level 1 result")
+                acceptable_results.append((item['info']['index'], item['level1_upload']))
+    
+    # Build final results array
+    results = [None] * len(images_info)
+    for idx, upload in acceptable_results:
+        result_idx = next(i for i, info in enumerate(images_info) if info['index'] == idx)
+        results[result_idx] = upload
+    
     return results
 
 @async_retry()
