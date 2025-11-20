@@ -77,8 +77,8 @@ class ImageProcessResponse(BaseModel):
 # --- 3. ساخت نمونه اصلی برنامه FastAPI ---
 app = FastAPI(
     title="Fully Resilient Basalam Image Processor",
-    description="سرویسی مقاوم برای پردازش تصویر با مکانیزم تلاش مجدد برای تمام سرویس‌های خارجی.",
-    version="4.0.0" # Version with Global Retry Decorator
+    description="سرویسی مقاوم برای پردازش تصویر - همه تصاویر ابتدا سانسور می‌شوند، سپس بررسی می‌شوند، و تصاویر forbidden حذف می‌گردند.",
+    version="5.0.0" # Version with Censor-First workflow
 )
 
 
@@ -432,40 +432,116 @@ async def process_censorship_batch(session: httpx.AsyncClient, forbidden_images:
 @app.post("/process-images", response_model=ImageProcessResponse)
 async def process_images_endpoint(request: ImageProcessRequest):
     """
-    New clean flow:
-    1. Upload all original images first → get permanent URLs
-    2. Check all permanent URLs with revision service
-    3. For forbidden images: apply progressive censorship
-    4. Return all final results
+    New workflow:
+    1. Download ALL images from temporary URLs
+    2. Censor ALL images first (before any revision check)
+    3. Upload all censored images to get permanent URLs
+    4. Check all censored images with revision service
+    5. Remove images with is_forbidden=true from results
+    6. Return only acceptable censored images
     """
     if not request.photo_links:
         return {"processed_images": []}
 
     async with httpx.AsyncClient() as session:
         print(f"\n{'='*60}")
-        print(f"STEP 1: Uploading {len(request.photo_links)} original images...")
+        print(f"STEP 1: Downloading {len(request.photo_links)} images...")
         print(f"{'='*60}")
 
-        # Step 1: Upload all original images to get permanent URLs
-        upload_tasks = [
-            download_and_upload_original(session, url, index)
-            for index, url in enumerate(request.photo_links)
+        # Step 1: Download all images
+        download_tasks = [
+            download_image(session, url)
+            for url in request.photo_links
         ]
-        uploaded_images = await asyncio.gather(*upload_tasks)
-        uploaded_images = [img for img in uploaded_images if img is not None]
+        download_results = await asyncio.gather(*download_tasks, return_exceptions=True)
 
-        if not uploaded_images:
-            print("✗ No images were successfully uploaded")
+        # Filter successful downloads
+        downloaded_images = []
+        for index, result in enumerate(download_results):
+            if isinstance(result, Exception):
+                print(f"[{index}] ✗ Failed to download: {result}")
+                continue
+            image_data, content_type = result
+            downloaded_images.append({
+                "index": index,
+                "image_data": image_data,
+                "content_type": content_type,
+                "original_url": request.photo_links[index]
+            })
+
+        if not downloaded_images:
+            print("✗ No images were successfully downloaded")
             return {"processed_images": []}
 
-        print(f"✓ Successfully uploaded {len(uploaded_images)} images")
+        print(f"✓ Successfully downloaded {len(downloaded_images)} images")
 
         print(f"\n{'='*60}")
-        print(f"STEP 2: Checking uploaded images with revision service...")
+        print(f"STEP 2: Censoring ALL {len(downloaded_images)} images...")
         print(f"{'='*60}")
 
-        # Step 2: Check all uploaded permanent URLs with revision service
-        uploaded_urls = [img["uploaded_url"] for img in uploaded_images]
+        # Step 2: Censor ALL images using batch censorship
+        try:
+            images_data = [(img["image_data"], img["content_type"]) for img in downloaded_images]
+            censored_images = await censor_images_batch(session, images_data)
+
+            # Pair censored results with original image info
+            censored_with_info = []
+            for img_info, censored_data in zip(downloaded_images, censored_images):
+                if censored_data is not None:
+                    censored_with_info.append({
+                        "index": img_info["index"],
+                        "censored_data": censored_data,
+                        "original_url": img_info["original_url"]
+                    })
+                else:
+                    print(f"[{img_info['index']}] ✗ Censorship failed, skipping image")
+
+            if not censored_with_info:
+                print("✗ All censorships failed")
+                return {"processed_images": []}
+
+            print(f"✓ Successfully censored {len(censored_with_info)}/{len(downloaded_images)} images")
+
+        except Exception as e:
+            print(f"✗ Batch censorship failed: {e}")
+            return {"processed_images": []}
+
+        print(f"\n{'='*60}")
+        print(f"STEP 3: Uploading {len(censored_with_info)} censored images...")
+        print(f"{'='*60}")
+
+        # Step 3: Upload all censored images
+        upload_tasks = [
+            upload_image_to_basalam(session, img["censored_data"], content_type="image/png")
+            for img in censored_with_info
+        ]
+        upload_results = await asyncio.gather(*upload_tasks, return_exceptions=True)
+
+        # Pair upload results with image info
+        uploaded_censored = []
+        for img_info, upload_result in zip(censored_with_info, upload_results):
+            if isinstance(upload_result, Exception):
+                print(f"[{img_info['index']}] ✗ Upload failed: {upload_result}")
+                continue
+            uploaded_censored.append({
+                "index": img_info["index"],
+                "uploaded_url": upload_result["url"],
+                "upload_result": upload_result,
+                "original_url": img_info["original_url"]
+            })
+
+        if not uploaded_censored:
+            print("✗ No censored images were successfully uploaded")
+            return {"processed_images": []}
+
+        print(f"✓ Successfully uploaded {len(uploaded_censored)} censored images")
+
+        print(f"\n{'='*60}")
+        print(f"STEP 4: Checking censored images with revision service...")
+        print(f"{'='*60}")
+
+        # Step 4: Check all censored uploaded images with revision service
+        uploaded_urls = [img["uploaded_url"] for img in uploaded_censored]
         try:
             revision_results = await check_images_revision(session, uploaded_urls)
 
@@ -473,8 +549,8 @@ async def process_images_endpoint(request: ImageProcessRequest):
             url_to_forbidden = {}
             for result in revision_results:
                 file_id = result.get('file_id')
-                if file_id is not None and file_id < len(uploaded_images):
-                    url = uploaded_images[file_id]["uploaded_url"]
+                if file_id is not None and file_id < len(uploaded_censored):
+                    url = uploaded_censored[file_id]["uploaded_url"]
                     url_to_forbidden[url] = result.get('is_forbidden', True)
 
             print(f"✓ Revision check completed")
@@ -482,41 +558,28 @@ async def process_images_endpoint(request: ImageProcessRequest):
         except Exception as e:
             print(f"⚠ Revision check failed: {e}")
             print(f"→ Assuming all images forbidden for safety")
-            url_to_forbidden = {img["uploaded_url"]: True for img in uploaded_images}
+            url_to_forbidden = {img["uploaded_url"]: True for img in uploaded_censored}
 
         print(f"\n{'='*60}")
-        print(f"STEP 3: Processing censorship for forbidden images...")
-        print(f"Using BATCH API for all forbidden images at once")
+        print(f"STEP 5: Filtering results - removing forbidden images...")
         print(f"{'='*60}")
 
-        # Step 3: Separate acceptable and forbidden images
-        acceptable_images = []
-        forbidden_images = []
-        
-        for img in uploaded_images:
+        # Step 5: Filter out images that are still forbidden after censorship
+        final_results = []
+        removed_count = 0
+
+        for img in uploaded_censored:
             is_forbidden = url_to_forbidden.get(img["uploaded_url"], True)
             if is_forbidden:
-                forbidden_images.append(img)
+                print(f"[{img['index']}] ✗ Still FORBIDDEN after censorship - REMOVED")
+                removed_count += 1
             else:
-                acceptable_images.append(img["upload_result"])
-        
-        print(f"→ {len(acceptable_images)} images are ACCEPTABLE (no censorship needed)")
-        print(f"→ {len(forbidden_images)} images are FORBIDDEN (need batch censorship)")
+                print(f"[{img['index']}] ✓ ACCEPTABLE after censorship - INCLUDED")
+                final_results.append(img["upload_result"])
 
-        # Apply batch censorship to all forbidden images at once
-        censored_results = await process_censorship_batch(session, forbidden_images)
-        
-        # Combine acceptable and censored results
-        results_with_none = acceptable_images + censored_results
-
-        # Filter out None results (skipped images that were still forbidden after censorship)
-        final_results = [result for result in results_with_none if result is not None]
-
-        skipped_count = len(results_with_none) - len(final_results)
         print(f"\n{'='*60}")
-        print(f"✓ COMPLETED: {len(final_results)} images processed successfully")
-        if skipped_count > 0:
-            print(f"⚠ SKIPPED: {skipped_count} images (still forbidden after censorship)")
+        print(f"✓ COMPLETED: {len(final_results)} acceptable images")
+        print(f"✗ REMOVED: {removed_count} forbidden images")
         print(f"{'='*60}\n")
 
     return {"processed_images": final_results}
