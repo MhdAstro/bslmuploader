@@ -99,20 +99,28 @@ async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str
     Uses bulk API first, falls back to single API calls if bulk fails (504 timeout).
     """
     bulk_url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector/bulk"
-    headers = {"api-token": settings.revision_api_token}
+    headers = {
+        "api-token": settings.revision_api_token,
+        "Content-Type": "application/json"
+    }
     payload = {"images": [{"file_id": index, "url": img_url} for index, img_url in enumerate(image_urls)]}
 
     try:
         print(f"Checking {len(image_urls)} images with bulk revision API...")
-        response = await session.post(bulk_url, headers=headers, json=payload, timeout=30.0)
+        print(f"DEBUG: Payload = {payload}")
+        response = await session.post(bulk_url, headers=headers, json=payload, timeout=40.0)
         response.raise_for_status()
         result = response.json()
-        print(f"✓ Bulk API check successful")
+        print(f"✓ Bulk API check successful: {result}")
         return result
 
     except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
         # Bulk API failed - fall back to individual single API calls
-        print(f"⚠ Bulk API failed ({type(e).__name__}), falling back to single API calls...")
+        print(f"⚠ Bulk API failed ({type(e).__name__}): {str(e)}")
+        if hasattr(e, 'response'):
+            print(f"  Response status: {e.response.status_code}")
+            print(f"  Response body: {e.response.text}")
+        print(f"  Falling back to single API calls...")
 
         results = []
         single_url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector"
@@ -134,6 +142,38 @@ async def check_images_revision(session: httpx.AsyncClient, image_urls: List[str
             except Exception as single_error:
                 print(f"✗ Single API failed for image {index}: {single_error}")
                 # Assume forbidden if check fails
+                results.append({
+                    "file_id": index,
+                    "url": img_url,
+                    "is_forbidden": True
+                })
+
+        print(f"✓ Completed {len(results)} single API checks")
+        return results
+
+    except Exception as e:
+        print(f"✗ Unexpected error in bulk revision check: {type(e).__name__}: {str(e)}")
+        print(f"  Falling back to single API calls...")
+
+        results = []
+        single_url = "https://revision.basalam.com/api_v1.0/validation/image/hijab-detector"
+        headers_single = {"api-token": settings.revision_api_token}
+
+        for index, img_url in enumerate(image_urls):
+            try:
+                params = {"image_url": img_url}
+                response = await session.get(single_url, headers=headers_single, params=params, timeout=30.0)
+                response.raise_for_status()
+                result = response.json()
+
+                results.append({
+                    "file_id": index,
+                    "url": img_url,
+                    "is_forbidden": result.get('is_forbidden', True)
+                })
+
+            except Exception as single_error:
+                print(f"✗ Single API failed for image {index}: {single_error}")
                 results.append({
                     "file_id": index,
                     "url": img_url,
